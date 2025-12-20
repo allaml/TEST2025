@@ -1,0 +1,289 @@
+Multi-Region DR POC requirements:
+--------------------------------
+- Can we use test001 one account has this has been migrated to Hub and spoke  Model?
+- Does it allow 10.0.0.0/8 from https by default or do we need to create a temp FW rule for poc testing?
+- If we enable enable-WindowsOptionalFeature -Online -FeatureName IIS-WebServerRole does security create team flag it as part of vulnerability scanning?
+- Planning to use Domain Name: drpocec1test.zayo.com as route53 public record in the test spoke account for DNS delegation
+
+
+Phase 1: EC2 Instances Setup (Day 1):
+---------------------------------------
+
+Step 1: Create EC2 in us-west-2 (Primary)
+
+EC2 Console → Launch Instance
+AMI: Windows Server 2022
+Instance Type: t3.medium
+VPC: Existing spoke VPC (us-west-2)
+Subnet: Private subnet
+Security Group: Create new
+Inbound: HTTP (80) from 10.0.0.0/8
+Inbound: HTTPS (443) from 10.0.0.0/8
+Advanced Details:
+IAM Role: EC2 with SSM permissions
+User Data: None
+No Public IP
+----------------------------------------------------------------------------------------
+Step 2: Create EC2 in us-east-1 (Secondary)
+
+Same configuration as Step 1 in us-east-1 spoke VPC
+
+----------------------------------------------------------------------------------------
+Phase 2: Application Configuration (Day 1)
+--------------------------------------------
+
+Step 3: Configure IIS on us-west-2
+
+Connect via Session Manager
+Install IIS:
+Enable-WindowsOptionalFeature -Online -FeatureName IIS-WebServerRole
+Create Custom Page:
+
+$html = @"
+<!DOCTYPE html>
+<html>
+<head><title>DR POC</title></head>
+<body>
+    <h1>Hello us-west-2 - Primary Region</h1>
+    <p>Server: $(hostname)</p>
+    <p>Timestamp: $(Get-Date)</p>
+    <p>Region: US-West-2 (Oregon)</p>
+</body>
+</html>
+"@
+$html | Out-File -FilePath "C:\inetpub\wwwroot\index.html" -Encoding UTF8
+
+----------------------------------------------------------------------------
+Step 4: Configure IIS on us-east-1
+Same as Step 3, but change content to "Hello us-east-1 - Secondary Region"
+
+-----------------------------------------------------------------------------------------------
+Phase 3: Load Balancers:
+-----------------------
+Step 5: Create Internal ALB in us-west-2:
+
+EC2 Console → Load Balancers → Create ALB
+Basic Configuration:
+Name: internal-alb-west-poc
+Scheme: Internal
+IP Address Type: IPv4
+Network Mapping:
+VPC: Existing spoke VPC (us-west-2)
+Subnets: Select 2 private subnets
+Security Groups:
+Create new: Allow HTTP (80) from 10.0.0.0/8
+Listeners and Routing:
+Protocol: HTTP, Port: 80
+Create Target Group:
+Name: tg-west-poc
+Target Type: Instances
+Protocol: HTTP, Port: 80
+Health Check: HTTP, Path: /
+Register Targets: Select us-west-2 EC2 instance
+
+Step 6: Create Internal ALB in us-east-1
+Same configuration as Step 5 in us-east-1
+
+-------------------------------------------------------------------------------------------------------
+
+Phase 4: Route 53 Health Checks:
+--------------------------------
+Step 7: Create Route 53 Health Checks
+
+Hub Account - Route 53 Console:
+Health Checks → Create Health Check
+us-west-2 Health Check:
+Name: health-check-west-poc
+Type: HTTP
+Domain Name: internal-alb-west-poc-123456789.us-west-2.elb.amazonaws.com
+Port: 80
+Path: /
+Request Interval: 30 seconds
+Failure Threshold: 3
+
+us-east-1 Health Check:
+Name: health-check-east-poc
+Same configuration with us-east-1 ALB DNS name
+
+Step 8: Create Public Hosted Zone
+
+Route 53 → Hosted Zones → Create
+Domain Name: drpocec1test.zayo.com
+Type: Public Hosted Zone
+Note Name Servers for DNS delegation
+
+-------------------------------------------------------------------------------------------------------------
+Phase 5: DNS Failover Records:
+------------------------------
+Step 9: Create Failover DNS Records
+
+- Create Primary Record:
+Record Name: app.drpoc.zayo.com
+Record Type: A
+Value: [Palo Alto Public IP] -- Switch to Hub Account
+                             -- EC2 Console → Instances
+                             -- Find Palo Alto instance (usually named with "palo" or "firewall")
+                             -- Instance Details → Public IPv4 address
+                             -- Copy IP = Your DNS record value
+TTL: 60 seconds
+Routing Policy: Failover
+Failover Record Type: Primary
+Health Check: Select us-west-2 health check
+Record ID: primary-west
+
+- Create Secondary Record:
+Record Name: app.drpoc.zayo.com
+Record Type: A
+Value: [Same Palo Alto Public IP]
+TTL: 60 seconds
+Routing Policy: Failover
+Failover Record Type: Secondary
+Health Check: Select us-east-1 health check
+Record ID: secondary-east
+
+Internet → Palo Alto (Hub Inspection VPC) → Transit Gateway → Spoke VPCs
+
+-----------------------------------------------------------------------------------------------------------
+Phase 6: Palo Alto Configuration: Internet → Palo Alto Firewall → Internal Resources →
+(Inbound traffic - users reaching poc application)
+
+----------------------------------
+Step 10: Configure Palo Alto NAT Rules
+
+Primary NAT Rule:
+Source: Any
+Destination: [Palo Alto Public IP]
+Service: HTTP/HTTPS
+Translated Address: [us-west-2 ALB IP]
+
+Secondary NAT Rule (Lower Priority):
+Source: Any  
+Destination: [Palo Alto Public IP]
+Service: HTTP/HTTPS
+Translated Address: [us-east-1 ALB IP]
+
+NAT Rules Needed:
+1. Primary Rule (Priority 1):
+-----------------------------
+   - Destination: Palo Alto Public IP
+   - Translate to: us-west-2 ALB IP
+   - Services: HTTP (80), HTTPS (443)
+   - Initially: ENABLED
+
+-------------------------------------------------------------------------------------------------
+Rule Name: DR-Primary-West
+Rule Type: Destination NAT (DNAT)
+Original Packet:
+  - Source Zone: untrust (internet-facing)
+  - Destination Zone: untrust
+  - Destination Interface: ethernet1/1 (external interface)
+  - Source Address: any
+  - Destination Address: 203.0.113.50 (Palo Alto Public IP)
+  - Service: service-http, service-https
+
+Translated Packet:
+  - Destination Address Translation:
+    - Type: Static IP
+    - Translated Address: 10.1.50.100 (us-west-2 ALB)
+  - Destination Zone: trust (internal-facing)
+
+Advanced:
+  - Enable Rule: Yes
+  - Priority/Order: 1 (highest priority)
+-------------------------------------------------------------------------------------------------
+
+2. Secondary Rule (Priority 2):
+-------------------------------
+   - Destination: Same Palo Alto Public IP
+   - Translate to: us-east-1 ALB IP
+   - Services: HTTP (80), HTTPS (443)
+   - Initially: DISABLED
+
+Rule Name: DR-Secondary-East
+Rule Type: Destination NAT (DNAT)
+Original Packet:
+  - Source Zone: untrust
+  - Destination Zone: untrust
+  - Destination Interface: ethernet1/1
+  - Source Address: any
+  - Destination Address: 203.0.113.50 (Same Public IP)
+  - Service: service-http, service-https
+
+Translated Packet:
+  - Destination Address Translation:
+    - Type: Static IP
+    - Translated Address: 10.2.50.100 (us-east-1 ALB)
+  - Destination Zone: trust
+
+Advanced:
+  - Enable Rule: No (initially disabled)
+  - Priority/Order: 2 (lower priority)
+
+----------------------------------------------------------------------------------------------------
+
+Failover Process: FW/Networking Team
+- When us-west-2 health check fails → Disable Rule 1, Enable Rule 2
+- When us-west-2 recovers → Enable Rule 1, Disable Rule 2
+
+--------------------------------------------------------------------------------------------------------
+Phase 7: Testing & Validation:
+-------------------------------
+
+Step 11: Functional Testing scenerios:
+
+Test 1: Normal Operation: User → app.drpoc.zayo.com → 203.0.113.50 → Palo Alto → us-west-2 ALB → "Hello us-west-2"
+Browse to http://app.drpoc.zayo.com
+Expected: "Hello us-west-2 - Primary Region"
+Verify: Route 53 health checks show "Success"
+
+Test 2: Primary Region Failure: User → app.drpoc.zayo.com → 203.0.113.50 → Palo Alto → us-east-1 ALB → "Hello us-east-1"
+
+Stop us-west-2 EC2 instance
+Wait 2-3 minutes for health check failure
+Browse to http://app.drpoc.zayo.com
+Expected: "Hello us-east-1 - Secondary Region"
+
+Test 3: Recovery Testing
+Start us-west-2 EC2 instance
+Wait 2-3 minutes for health check recovery
+Browse to http://app.drpoc.zayo.com
+Expected: Back to "Hello us-west-2 - Primary Region"
+
+-------------------------------------------------------------------------------------------------------------
+Step 12: Monitoring Dashboard
+
+CloudWatch Dashboard:
+---------------------
+CloudWatch → Dashboards → Create
+Add Widgets:
+Route 53 Health Check Status
+ALB Target Health (both regions)
+
+EC2 Instance Status
+Total Effort: 16 hours (2 days)
+Phase	Tasks	Effort
+Phase 1	EC2 Setup	.5 hours
+Phase 2	IIS Configuration	2 hours
+Phase 3	Load Balancers	2 hours
+Phase 4	Health Checks	1.5 hours
+Phase 5	DNS Records	1 hour
+Phase 6	Palo Alto Config	2 hours
+Phase 7	Testing	4 hours
+
+Success Criteria
+✅ Automatic failover within 3 minutes
+✅ Different region messages displayed
+✅ Successful failback to primary
+✅ Zero manual DNS changes required
+
+This simplified approach leverages your existing Hub-Spoke infrastructure and focuses only on the DR application components.
+
+
+Hub Account Only:
+
+✅ Single Lambda function
+✅ Centralized custom health monitoring logic
+⚠️ CloudWatch custom metrics in one place, native metrics distributed
+✅ Single dashboard with cross-region widgets
+
+Native EC2/ALB metrics remain in their respective regions. Only the Lambda-generated custom health metrics are centralized in the Hub account.
